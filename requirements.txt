@@ -1,0 +1,6 @@
+pandas
+dropbox
+requests
+schedule
+python-dotenv
+openpyxl

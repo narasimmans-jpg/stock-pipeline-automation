@@ -36,13 +36,3 @@ jobs:
           GMAIL_APP_PASSWORD:     ${{ secrets.GMAIL_APP_PASSWORD }}
           GMAIL_RECIPIENT:        ${{ secrets.GMAIL_RECIPIENT }}
         run: python stock_pipeline.py
-```
-
-**And replace your `requirements.txt` with pinned versions:**
-```
-dropbox==12.0.2
-pandas==2.2.2
-openpyxl==3.1.4
-requests==2.32.3
-schedule==1.2.2
-python-dotenv==1.0.1

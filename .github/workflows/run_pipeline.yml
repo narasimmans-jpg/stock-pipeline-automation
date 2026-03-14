@@ -2,12 +2,13 @@ name: Run Stock Pipeline
 
 on:
   schedule:
-    - cron: '0 5 * * *'   # 10:30 AM IST
+    - cron: '0 5 * * *'   # 10:30 AM IST = 05:00 UTC
   workflow_dispatch:
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repo
@@ -17,11 +18,31 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install Libraries
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Run Script
-        run: |
-          python stock_pipeline.py
+        env:
+          RUN_MODE: github                                         # ← CRITICAL #1
+          DROPBOX_APP_KEY:        ${{ secrets.DROPBOX_APP_KEY }}  # ← CRITICAL #2
+          DROPBOX_APP_SECRET:     ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN:  ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          DROPBOX_INPUT_STOCK:    ${{ secrets.DROPBOX_INPUT_STOCK }}
+          DROPBOX_INPUT_PIPELINE: ${{ secrets.DROPBOX_INPUT_PIPELINE }}
+          DROPBOX_OUTPUT_PATH:    ${{ secrets.DROPBOX_OUTPUT_PATH }}
+          GMAIL_SENDER:           ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASSWORD:     ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_RECIPIENT:        ${{ secrets.GMAIL_RECIPIENT }}
+        run: python stock_pipeline.py
+```
+
+**And replace your `requirements.txt` with pinned versions:**
+```
+dropbox==12.0.2
+pandas==2.2.2
+openpyxl==3.1.4
+requests==2.32.3
+schedule==1.2.2
+python-dotenv==1.0.1

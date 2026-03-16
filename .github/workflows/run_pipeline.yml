@@ -5,6 +5,9 @@ on:
     - cron: '0 5 * * *'   # 10:30 AM IST = 05:00 UTC
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # ← fixes Node.js 20 deprecation warning
+
 jobs:
   run-script:
     runs-on: ubuntu-latest

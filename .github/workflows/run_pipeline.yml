@@ -12,10 +12,10 @@ jobs:
 
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -25,14 +25,11 @@ jobs:
 
       - name: Run Script
         env:
-          RUN_MODE: github                                         # ← CRITICAL #1
-          DROPBOX_APP_KEY:        ${{ secrets.DROPBOX_APP_KEY }}  # ← CRITICAL #2
-          DROPBOX_APP_SECRET:     ${{ secrets.DROPBOX_APP_SECRET }}
-          DROPBOX_REFRESH_TOKEN:  ${{ secrets.DROPBOX_REFRESH_TOKEN }}
-          DROPBOX_INPUT_STOCK:    ${{ secrets.DROPBOX_INPUT_STOCK }}
-          DROPBOX_INPUT_PIPELINE: ${{ secrets.DROPBOX_INPUT_PIPELINE }}
-          DROPBOX_OUTPUT_PATH:    ${{ secrets.DROPBOX_OUTPUT_PATH }}
-          GMAIL_SENDER:           ${{ secrets.GMAIL_SENDER }}
-          GMAIL_APP_PASSWORD:     ${{ secrets.GMAIL_APP_PASSWORD }}
-          GMAIL_RECIPIENT:        ${{ secrets.GMAIL_RECIPIENT }}
+          RUN_MODE: github
+          DROPBOX_APP_KEY:       ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET:    ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          GMAIL_SENDER:          ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASSWORD:    ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_RECIPIENTS:      ${{ secrets.GMAIL_RECIPIENTS }}
         run: python stock_pipeline.py

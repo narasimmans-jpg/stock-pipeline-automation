@@ -3,14 +3,16 @@ stock_pipeline.py
 =================
 Unified, production-ready Stock & Pipeline Analysis tool.
 
+All files are read from and written to Dropbox — no local file paths are used.
+
 Supports TWO run modes:
-  1. LOCAL  – reads files from local/Dropbox paths, schedules daily at 10:30 AM
+  1. LOCAL  – reads/writes files via Dropbox API, schedules daily at 10:30 AM
   2. GITHUB – downloads files from Dropbox via API, processes, uploads output,
               sends email notification. Triggered by GitHub Actions.
 
 Mode is selected by the environment variable RUN_MODE:
-  RUN_MODE=github  → GitHub / Cloud mode  (uses Dropbox API + env-var credentials)
-  RUN_MODE=local   → Local mode           (uses local file paths + built-in creds)
+  RUN_MODE=github  → GitHub / Cloud mode  (uses env-var credentials)
+  RUN_MODE=local   → Local mode           (uses hardcoded credentials)
   (default)        → Local mode
 
 Usage:
@@ -22,6 +24,7 @@ Usage:
 # ──────────────────────────────────────────────────────────────────────────────
 # Imports
 # ──────────────────────────────────────────────────────────────────────────────
+import io
 import logging
 import os
 import smtplib
@@ -42,7 +45,6 @@ from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.dataframe import dataframe_to_rows  # noqa: F401  (kept for reference)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Bootstrap
@@ -53,7 +55,7 @@ warnings.filterwarnings("ignore")
 RUN_MODE = os.getenv("RUN_MODE", "local").lower()   # "local" | "github"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging  (file handler only in local mode so GitHub logs stay clean)
+# Logging
 # ──────────────────────────────────────────────────────────────────────────────
 _handlers = [logging.StreamHandler(sys.stdout)]
 if RUN_MODE == "local":
@@ -71,60 +73,34 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
-class LocalConfig:
-    """Credentials and paths used when running on a local Windows machine."""
-
-    # ── Gmail ───────────────────────────────────────────────────────
-    GMAIL_SENDER: str       = "businesssupport@technosport.in"
-    GMAIL_APP_PASSWORD: str = "ctck cvix qafj dpoi"
-    GMAIL_RECIPIENTS: list  = [
-        "narasimman.s@technosport.in",
-        # add more recipients here if needed
-    ]
-
-    # ── File paths ──────────────────────────────────────────────────
-    STOCK_FILE: str    = r"C:\Users\narasimman.s\Downloads\stock_pipeline.xlsx"
-    PIPELINE_FILE: str = r"D:\Dropbox\Dropbox\ODOO B2B REPORT\DATA FILE\Simma\pipeline1.xlsx"
-    OUTPUT_FILE: str   = r"C:\Users\narasimman.s\Downloads\Stock_Pipeline_Analysis_Report.xlsx"
-
-    # ── Schedule ─────────────────────────────────────────────────────
-    SCHEDULE_TIME: str = "10:30"   # 24-hour HH:MM, IST
-
-
-class GitHubConfig:
+class Config:
     """
-    Credentials and paths for GitHub Actions / Cloud mode.
-    Every value is read from environment variables / GitHub Secrets.
+    Single config class for both LOCAL and GITHUB modes.
+    Credentials are hardcoded for local mode and overridden by env-vars in GitHub mode.
+    All file references are Dropbox paths — no local disk paths.
     """
 
     # ── Dropbox OAuth2 ───────────────────────────────────────────────
     APP_KEY:       str = os.getenv("DROPBOX_APP_KEY",       "21xua5rf8nm6ifj")
-    APP_SECRET:    str = os.getenv("DROPBOX_APP_SECRET",    "")
-    REFRESH_TOKEN: str = os.getenv("DROPBOX_REFRESH_TOKEN", "")
+    APP_SECRET:    str = os.getenv("DROPBOX_APP_SECRET",    "2acad38snjh8wbn")
+    REFRESH_TOKEN: str = os.getenv("DROPBOX_REFRESH_TOKEN", "bnW7Ua14IPIAAAAAAAAAAQKVYvrgPzTUU9Hv2a89vMQKCVjh1_ff_hZza3QzJGjJ")
 
-    # ── Dropbox remote paths ─────────────────────────────────────────
-    DROPBOX_INPUT_STOCK:    str = os.getenv(
-        "DROPBOX_INPUT_STOCK",
-        "/ODOO B2B REPORT/DATA FILE/Simma/stock_pipeline.xlsx",
-    )
-    DROPBOX_INPUT_PIPELINE: str = os.getenv(
-        "DROPBOX_INPUT_PIPELINE",
-        "/ODOO B2B REPORT/DATA FILE/Simma/pipeline1.xlsx",
-    )
-    DROPBOX_OUTPUT_PATH:    str = os.getenv(
-        "DROPBOX_OUTPUT_PATH",
-        "/ODOO B2B REPORT/DATA FILE/Simma/Stock_Pipeline_Analysis_Report.xlsx",
-    )
-
-    # ── Local temp paths inside the Actions runner ──────────────────
-    LOCAL_STOCK:    str = "/tmp/stock_pipeline.xlsx"
-    LOCAL_PIPELINE: str = "/tmp/pipeline1.xlsx"
-    LOCAL_OUTPUT:   str = "/tmp/Stock_Pipeline_Analysis_Report.xlsx"
+    # ── Dropbox file paths ───────────────────────────────────────────
+    DROPBOX_STOCK_FILE:   str = "/ODOO B2B REPORT/stock_report.xlsx"
+    DROPBOX_PIPELINE_FILE: str = "/ODOO B2B REPORT/DATA FILE/Simma/pipeline1.xlsx"
+    DROPBOX_OUTPUT_FILE:  str = "/ODOO B2B REPORT/DATA FILE/Simma/Stock_Pipeline_Analysis_Report.xlsx"
 
     # ── Gmail ────────────────────────────────────────────────────────
-    GMAIL_SENDER:       str = os.getenv("GMAIL_SENDER",       "")
-    GMAIL_APP_PASSWORD: str = os.getenv("GMAIL_APP_PASSWORD", "")
-    GMAIL_RECIPIENT:    str = os.getenv("GMAIL_RECIPIENT",    "")
+    GMAIL_SENDER:       str = os.getenv("GMAIL_SENDER",       "businesssupport@technosport.in")
+    GMAIL_APP_PASSWORD: str = os.getenv("GMAIL_APP_PASSWORD", "ctck cvix qafj dpoi")
+    GMAIL_RECIPIENTS:   list = [
+        r.strip()
+        for r in os.getenv("GMAIL_RECIPIENTS", "narasimman.s@technosport.in").split(",")
+        if r.strip()
+    ]
+
+    # ── Schedule ─────────────────────────────────────────────────────
+    SCHEDULE_TIME: str = "10:30"   # 24-hour HH:MM, IST
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -151,48 +127,47 @@ COLUMN_ORDER = [
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ① Dropbox helpers  (GitHub mode only)
+# ① Dropbox helpers
 # ──────────────────────────────────────────────────────────────────────────────
-def get_dropbox_access_token() -> str:
-    """Exchange the stored refresh token for a short-lived access token."""
+def get_dropbox_client() -> dropbox.Dropbox:
+    """Exchange refresh token for a short-lived access token and return a Dropbox client."""
     logger.info("🔑 Requesting Dropbox access token …")
     resp = requests.post(
         "https://api.dropbox.com/oauth2/token",
         data={
             "grant_type":    "refresh_token",
-            "refresh_token": GitHubConfig.REFRESH_TOKEN,
-            "client_id":     GitHubConfig.APP_KEY,
-            "client_secret": GitHubConfig.APP_SECRET,
+            "refresh_token": Config.REFRESH_TOKEN,
+            "client_id":     Config.APP_KEY,
+            "client_secret": Config.APP_SECRET,
         },
         timeout=30,
     )
     resp.raise_for_status()
     token = resp.json()["access_token"]
     logger.info("✅ Dropbox access token obtained.")
-    return token
+    dbx = dropbox.Dropbox(oauth2_access_token=token)
+    dbx.users_get_current_account()
+    logger.info("✅ Dropbox connection verified.")
+    return dbx
 
 
-def download_from_dropbox(dbx: dropbox.Dropbox, dropbox_path: str, local_path: str) -> bool:
-    """Download a single file from Dropbox. Returns True on success."""
+def download_bytes_from_dropbox(dbx: dropbox.Dropbox, dropbox_path: str) -> bytes | None:
+    """Download a file from Dropbox and return its raw bytes. Returns None on failure."""
     try:
         logger.info("⬇️  Downloading '%s' …", dropbox_path)
         _, res = dbx.files_download(dropbox_path)
-        with open(local_path, "wb") as fh:
-            fh.write(res.content)
-        logger.info("   Saved → '%s'  (%.1f KB)", local_path, len(res.content) / 1024)
-        return True
+        logger.info("   Downloaded %.1f KB", len(res.content) / 1024)
+        return res.content
     except dropbox.exceptions.ApiError as exc:
         logger.warning("⚠️  Could not download '%s': %s", dropbox_path, exc)
-        return False
+        return None
 
 
-def upload_to_dropbox(dbx: dropbox.Dropbox, local_path: str, dropbox_path: str) -> None:
-    """Upload local_path to Dropbox, overwriting any existing file."""
-    logger.info("⬆️  Uploading '%s' → '%s' …", local_path, dropbox_path)
-    with open(local_path, "rb") as fh:
-        data = fh.read()
+def upload_bytes_to_dropbox(dbx: dropbox.Dropbox, data: bytes, dropbox_path: str) -> None:
+    """Upload bytes to Dropbox, overwriting any existing file."""
+    logger.info("⬆️  Uploading to '%s' (%.1f KB) …", dropbox_path, len(data) / 1024)
     dbx.files_upload(data, dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
-    logger.info("   Upload complete (%.1f KB).", len(data) / 1024)
+    logger.info("   Upload complete.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -214,15 +189,11 @@ def filter_blank_styles(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def process_stock_data(stock_file_path: str) -> pd.DataFrame:
-    """Load, normalise, filter, and aggregate the stock Excel file."""
-    logger.info("📊 Processing stock data: %s", stock_file_path)
+def process_stock_data(file_bytes: bytes) -> pd.DataFrame:
+    """Load, normalise, filter, and aggregate the stock Excel file from bytes."""
+    logger.info("📊 Processing stock data …")
 
-    if not os.path.exists(stock_file_path):
-        logger.error("❌ Stock file not found: %s", stock_file_path)
-        return pd.DataFrame()
-
-    df = pd.read_excel(stock_file_path, engine="openpyxl")
+    df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
     if df.empty:
         logger.error("❌ Stock file is empty.")
         return pd.DataFrame()
@@ -276,8 +247,11 @@ def process_stock_data(stock_file_path: str) -> pd.DataFrame:
     if "CATEGORY" not in df.columns:
         logger.warning("⚠️  'CAT SALES' / 'CATEGORY' column not found – no category grouping.")
 
-    # ── Combine paired youth size columns (e.g. 06Y + 06Y/S) ────────
-    for old, new in [("06Y","06Y/S"),("08Y","08Y/M"),("10Y","10Y/L"),("12Y","12Y/XL"),("14Y","14Y/2XL")]:
+    # ── Combine paired youth size columns ────────────────────────────
+    for old, new in [
+        ("06Y", "06Y/S"), ("08Y", "08Y/M"), ("10Y", "10Y/L"),
+        ("12Y", "12Y/XL"), ("14Y", "14Y/2XL"),
+    ]:
         if old in df.columns and new in df.columns:
             df[new] = df[old].fillna(0) + df[new].fillna(0)
             df.drop(columns=[old], inplace=True)
@@ -308,16 +282,12 @@ def process_stock_data(stock_file_path: str) -> pd.DataFrame:
     return df
 
 
-def process_pipeline_data(pipeline_file_path: str) -> pd.DataFrame:
-    """Load and summarise the pipeline Excel file."""
-    logger.info("📈 Processing pipeline data: %s", pipeline_file_path)
+def process_pipeline_data(file_bytes: bytes) -> pd.DataFrame:
+    """Load and summarise the pipeline Excel file from bytes."""
+    logger.info("📈 Processing pipeline data …")
     _empty = pd.DataFrame(columns=["STYLE", "MONTH"])
 
-    if not pipeline_file_path or not os.path.exists(pipeline_file_path):
-        logger.warning("⚠️  Pipeline file not found: %s", pipeline_file_path)
-        return _empty
-
-    df = pd.read_excel(pipeline_file_path, engine="openpyxl")
+    df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
     if df.empty:
         logger.warning("⚠️  Pipeline file is empty.")
         return _empty
@@ -359,9 +329,9 @@ def process_pipeline_data(pipeline_file_path: str) -> pd.DataFrame:
     )
 
     # ── Build working frame ──────────────────────────────────────────
-    keep   = ["STYLE", month_col] + ([oqty_col] if oqty_col else [])
-    df     = df[keep].copy()
-    rn     = {month_col: "MONTH"}
+    keep = ["STYLE", month_col] + ([oqty_col] if oqty_col else [])
+    df   = df[keep].copy()
+    rn   = {month_col: "MONTH"}
     if oqty_col:
         rn[oqty_col] = "O_QTY"
     df = df.rename(columns=rn)
@@ -448,7 +418,7 @@ def merge_and_finalize_data(stock_df: pd.DataFrame, pipeline_df: pd.DataFrame) -
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ③ Excel report builder
+# ③ Excel report builder  (returns bytes — never writes to disk)
 # ──────────────────────────────────────────────────────────────────────────────
 def _border(color: str = "D1D1D1") -> Border:
     s = Side(style="thin", color=color)
@@ -475,6 +445,7 @@ def _title_row(ws, text: str, color: str, row: int = 1) -> None:
 def _write_df(ws, df: pd.DataFrame, start_row: int = 3,
               hdr_color: str = "4472C4", highlight_last: bool = False) -> None:
     """Write DataFrame into ws with alternating row colours."""
+    import math
     ALT1, ALT2, TOTAL = "F2F2F2", "FFFFFF", "FFD966"
 
     for c_idx, col in enumerate(df.columns, 1):
@@ -485,11 +456,11 @@ def _write_df(ws, df: pd.DataFrame, start_row: int = 3,
         is_total = highlight_last and r_off == len(df)
         bg       = TOTAL if is_total else (ALT1 if r_off % 2 == 0 else ALT2)
         for c_idx, val in enumerate(row, 1):
-            v    = "" if (isinstance(val, float) and __import__("math").isnan(val)) else val
+            v    = "" if (isinstance(val, float) and math.isnan(val)) else val
             cell = ws.cell(row=r_idx, column=c_idx, value=v)
-            cell.fill   = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
-            cell.border = _border()
-            cell.font   = Font(size=10, bold=is_total)
+            cell.fill      = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
+            cell.border    = _border()
+            cell.font      = Font(size=10, bold=is_total)
             cell.alignment = Alignment(
                 horizontal=("right" if isinstance(v, (int, float)) else "left"),
                 vertical="center",
@@ -506,16 +477,12 @@ def _autofit(ws, df: pd.DataFrame) -> None:
         ws.column_dimensions[get_column_letter(c_idx)].width = min(max(mx + 2, 10), 42)
 
 
-def create_excel_report(df: pd.DataFrame, output_file: str) -> bool:
-    """Build a multi-sheet styled Excel workbook."""
-    logger.info("📄 Creating Excel report …")
+def create_excel_report_bytes(df: pd.DataFrame) -> bytes | None:
+    """Build a multi-sheet styled Excel workbook and return it as bytes."""
+    logger.info("📄 Creating Excel report in memory …")
     if df.empty:
         logger.error("❌ No data – cannot create report.")
-        return False
-
-    out_dir = os.path.dirname(output_file)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+        return None
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -528,12 +495,12 @@ def create_excel_report(df: pd.DataFrame, output_file: str) -> bool:
 
     # ── Sheet 2 : Category summary ───────────────────────────────────
     if "CATEGORY" in df.columns:
-        agg  = [c for c in SIZE_COLUMNS if c in df.columns]
-        cdf  = df.groupby("CATEGORY")[agg].sum().reset_index()
-        tot  = cdf.sum(numeric_only=True)
+        agg = [c for c in SIZE_COLUMNS if c in df.columns]
+        cdf = df.groupby("CATEGORY")[agg].sum().reset_index()
+        tot = cdf.sum(numeric_only=True)
         tot["CATEGORY"] = "TOTAL"
-        cdf  = pd.concat([cdf, pd.DataFrame([tot])], ignore_index=True)
-        ws2  = wb.create_sheet("Category Summary")
+        cdf = pd.concat([cdf, pd.DataFrame([tot])], ignore_index=True)
+        ws2 = wb.create_sheet("Category Summary")
         _title_row(ws2, "CATEGORY SALES SUMMARY", "70AD47")
         _write_df(ws2, cdf, start_row=3, hdr_color="70AD47", highlight_last=True)
         _autofit(ws2, cdf)
@@ -542,12 +509,12 @@ def create_excel_report(df: pd.DataFrame, output_file: str) -> bool:
 
     # ── Sheet 3 : Series summary ─────────────────────────────────────
     if "SERIES" in df.columns:
-        agg  = [c for c in SIZE_COLUMNS if c in df.columns]
-        sdf  = df.groupby("SERIES")[agg].sum().reset_index()
-        tot  = sdf.sum(numeric_only=True)
+        agg = [c for c in SIZE_COLUMNS if c in df.columns]
+        sdf = df.groupby("SERIES")[agg].sum().reset_index()
+        tot = sdf.sum(numeric_only=True)
         tot["SERIES"] = "TOTAL"
-        sdf  = pd.concat([sdf, pd.DataFrame([tot])], ignore_index=True)
-        ws3  = wb.create_sheet("Series Summary")
+        sdf = pd.concat([sdf, pd.DataFrame([tot])], ignore_index=True)
+        ws3 = wb.create_sheet("Series Summary")
         _title_row(ws3, "SERIES SUMMARY", "7030A0")
         _write_df(ws3, sdf, start_row=3, hdr_color="7030A0", highlight_last=True)
         _autofit(ws3, sdf)
@@ -556,11 +523,11 @@ def create_excel_report(df: pd.DataFrame, output_file: str) -> bool:
     ws4 = wb.create_sheet("Executive Summary")
     _title_row(ws4, "EXECUTIVE SUMMARY", "4472C4")
 
-    total_stock = int(df["STOCK"].sum())   if "STOCK"  in df.columns else 0
-    avg_stock   = round(df["STOCK"].mean(), 1) if "STOCK"  in df.columns and len(df) else 0
-    max_stock   = int(df["STOCK"].max())   if "STOCK"  in df.columns else 0
-    min_stock   = int(df["STOCK"].min())   if "STOCK"  in df.columns else 0
-    n_series    = df["SERIES"].nunique()   if "SERIES" in df.columns else "N/A"
+    total_stock = int(df["STOCK"].sum())        if "STOCK"  in df.columns else 0
+    avg_stock   = round(df["STOCK"].mean(), 1)  if "STOCK"  in df.columns and len(df) else 0
+    max_stock   = int(df["STOCK"].max())        if "STOCK"  in df.columns else 0
+    min_stock   = int(df["STOCK"].min())        if "STOCK"  in df.columns else 0
+    n_series    = df["SERIES"].nunique()        if "SERIES" in df.columns else "N/A"
     n_pipeline  = int((df["MONTH"] != "").sum()) if "MONTH" in df.columns else 0
 
     kpis = [
@@ -596,9 +563,13 @@ def create_excel_report(df: pd.DataFrame, output_file: str) -> bool:
         except Exception:
             pass
 
-    wb.save(output_file)
-    logger.info("✅ Excel report saved: %s", output_file)
-    return True
+    # ── Save to bytes buffer ─────────────────────────────────────────
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    data = buf.read()
+    logger.info("✅ Excel report created in memory (%.1f KB).", len(data) / 1024)
+    return data
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -619,7 +590,7 @@ Please find attached the Stock and Pipeline Analysis Report.
   Series Count : {summary.get('series_count', 'N/A')}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-The output file has also been uploaded back to Dropbox (GitHub mode).
+The output file has also been uploaded back to Dropbox.
 
 This is an automated report. Contact IT if you have any issues.
 
@@ -638,7 +609,7 @@ The Stock Pipeline encountered an error and did not complete successfully.
 Error Details:
 {error or 'Unknown error – check the logs.'}
 
-Please check the GitHub Actions run logs for the full traceback.
+Please check the logs for the full traceback.
 
 Best regards,
 Automated Reporting System"""
@@ -651,28 +622,26 @@ def send_email(
     sender: str,
     password: str,
     recipients: list,
-    attachment_path: str = "",
+    attachment_bytes: bytes = b"",
+    attachment_name: str = "",
 ) -> bool:
-    """Send an email via Gmail SMTP with an optional Excel attachment."""
+    """Send an email via Gmail SMTP with an optional in-memory Excel attachment."""
     recipients = [r.strip() for r in recipients if r.strip()]
     if not recipients:
         logger.error("❌ No valid email recipients.")
         return False
 
     logger.info("✉️  Sending email to: %s", recipients)
-    msg             = MIMEMultipart()
-    msg["From"]     = sender
-    msg["To"]       = ", ".join(recipients)
-    msg["Subject"]  = subject
+    msg            = MIMEMultipart()
+    msg["From"]    = sender
+    msg["To"]      = ", ".join(recipients)
+    msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    if attachment_path and os.path.exists(attachment_path):
-        with open(attachment_path, "rb") as fh:
-            part = MIMEApplication(fh.read(), Name=os.path.basename(attachment_path))
-        part["Content-Disposition"] = f'attachment; filename="{os.path.basename(attachment_path)}"'
+    if attachment_bytes and attachment_name:
+        part = MIMEApplication(attachment_bytes, Name=attachment_name)
+        part["Content-Disposition"] = f'attachment; filename="{attachment_name}"'
         msg.attach(part)
-    elif attachment_path:
-        logger.warning("⚠️  Attachment not found: %s", attachment_path)
 
     try:
         with smtplib.SMTP("smtp.gmail.com", 587) as srv:
@@ -687,50 +656,58 @@ def send_email(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ⑤ Run orchestrators
+# ⑤ Core pipeline  (shared by both modes)
 # ──────────────────────────────────────────────────────────────────────────────
-def run_pipeline_github() -> bool:
+def run_pipeline() -> bool:
     """
-    GitHub Actions mode:
-      Authenticate Dropbox → Download files → Process → Upload output → Email
+    Main pipeline logic:
+      Authenticate Dropbox → Download files → Process → Build report →
+      Upload output to Dropbox → Send email with attachment
+    Everything is done in memory — no local disk I/O.
     """
     logger.info("═" * 65)
-    logger.info("🚀 GITHUB MODE – starting at %s IST", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info(
+        "🚀 PIPELINE START [%s mode] – %s IST",
+        RUN_MODE.upper(),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
     logger.info("═" * 65)
 
     summary = None
+    report_bytes = b""
+
     try:
-        # 1. Authenticate
-        token = get_dropbox_access_token()
-        dbx   = dropbox.Dropbox(oauth2_access_token=token)
-        dbx.users_get_current_account()
-        logger.info("✅ Dropbox connection verified.")
+        # 1. Authenticate Dropbox
+        dbx = get_dropbox_client()
 
         # 2. Download stock file (mandatory)
-        ok = download_from_dropbox(dbx, GitHubConfig.DROPBOX_INPUT_STOCK, GitHubConfig.LOCAL_STOCK)
-        if not ok:
-            raise FileNotFoundError(f"Stock file unavailable on Dropbox: {GitHubConfig.DROPBOX_INPUT_STOCK}")
+        stock_bytes = download_bytes_from_dropbox(dbx, Config.DROPBOX_STOCK_FILE)
+        if stock_bytes is None:
+            raise FileNotFoundError(f"Stock file unavailable on Dropbox: {Config.DROPBOX_STOCK_FILE}")
 
         # 3. Download pipeline file (optional)
-        pipeline_ok = download_from_dropbox(dbx, GitHubConfig.DROPBOX_INPUT_PIPELINE, GitHubConfig.LOCAL_PIPELINE)
-        if not pipeline_ok:
+        pipeline_bytes = download_bytes_from_dropbox(dbx, Config.DROPBOX_PIPELINE_FILE)
+        if pipeline_bytes is None:
             logger.warning("⚠️  Pipeline file unavailable – continuing without it.")
 
-        # 4. Process
-        stock_df    = process_stock_data(GitHubConfig.LOCAL_STOCK)
+        # 4. Process data
+        stock_df = process_stock_data(stock_bytes)
         if stock_df.empty:
             raise ValueError("Stock data processing returned empty DataFrame.")
 
         pipeline_df = (
-            process_pipeline_data(GitHubConfig.LOCAL_PIPELINE) if pipeline_ok
+            process_pipeline_data(pipeline_bytes)
+            if pipeline_bytes is not None
             else pd.DataFrame(columns=["STYLE", "MONTH"])
         )
-        final_df    = merge_and_finalize_data(stock_df, pipeline_df)
+
+        final_df = merge_and_finalize_data(stock_df, pipeline_df)
         if final_df.empty:
             raise ValueError("Merged final data is empty.")
 
-        # 5. Create report
-        if not create_excel_report(final_df, GitHubConfig.LOCAL_OUTPUT):
+        # 5. Build Excel report (in memory)
+        report_bytes = create_excel_report_bytes(final_df)
+        if not report_bytes:
             raise RuntimeError("Excel report creation failed.")
 
         summary = {
@@ -739,18 +716,22 @@ def run_pipeline_github() -> bool:
             "series_count": final_df["SERIES"].nunique() if "SERIES" in final_df.columns else 0,
         }
 
-        # 6. Upload output
-        upload_to_dropbox(dbx, GitHubConfig.LOCAL_OUTPUT, GitHubConfig.DROPBOX_OUTPUT_PATH)
+        # 6. Upload output back to Dropbox
+        upload_bytes_to_dropbox(dbx, report_bytes, Config.DROPBOX_OUTPUT_FILE)
 
-        # 7. Email success
+        # 7. Email success with attachment
         subject, body = _email_content("success", summary)
-        send_email(subject, body,
-                   GitHubConfig.GMAIL_SENDER, GitHubConfig.GMAIL_APP_PASSWORD,
-                   [GitHubConfig.GMAIL_RECIPIENT],
-                   attachment_path=GitHubConfig.LOCAL_OUTPUT)
+        send_email(
+            subject, body,
+            Config.GMAIL_SENDER, Config.GMAIL_APP_PASSWORD,
+            Config.GMAIL_RECIPIENTS,
+            attachment_bytes=report_bytes,
+            attachment_name="Stock_Pipeline_Analysis_Report.xlsx",
+        )
 
         logger.info("═" * 65)
-        logger.info("✅ GITHUB Pipeline completed successfully!")
+        logger.info("✅ Pipeline completed successfully!")
+        logger.info("   Dropbox output → %s", Config.DROPBOX_OUTPUT_FILE)
         logger.info("═" * 65)
         return True
 
@@ -759,67 +740,13 @@ def run_pipeline_github() -> bool:
         logger.error("❌ Pipeline failed:\n%s", err)
         try:
             subject, body = _email_content("failure", None, error=err)
-            send_email(subject, body,
-                       GitHubConfig.GMAIL_SENDER, GitHubConfig.GMAIL_APP_PASSWORD,
-                       [GitHubConfig.GMAIL_RECIPIENT])
+            send_email(
+                subject, body,
+                Config.GMAIL_SENDER, Config.GMAIL_APP_PASSWORD,
+                Config.GMAIL_RECIPIENTS,
+            )
         except Exception as mail_err:
             logger.error("❌ Could not send failure email: %s", mail_err)
-        return False
-
-
-def run_pipeline_local() -> bool:
-    """
-    Local mode:
-      Read local files → Process → Save report → Email with attachment
-    """
-    logger.info("═" * 65)
-    logger.info("🚀 LOCAL MODE – starting at %s IST", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    logger.info("═" * 65)
-
-    try:
-        if not os.path.exists(LocalConfig.STOCK_FILE):
-            logger.error("❌ Stock file not found: %s", LocalConfig.STOCK_FILE)
-            return False
-
-        if not os.path.exists(LocalConfig.PIPELINE_FILE):
-            logger.warning("⚠️  Pipeline file not found: %s – continuing without it.", LocalConfig.PIPELINE_FILE)
-
-        stock_df    = process_stock_data(LocalConfig.STOCK_FILE)
-        if stock_df.empty:
-            logger.error("❌ Aborting: stock data processing failed.")
-            return False
-
-        pipeline_df = process_pipeline_data(LocalConfig.PIPELINE_FILE)
-        final_df    = merge_and_finalize_data(stock_df, pipeline_df)
-        if final_df.empty:
-            logger.error("❌ Aborting: merged data is empty.")
-            return False
-
-        if not create_excel_report(final_df, LocalConfig.OUTPUT_FILE):
-            logger.error("❌ Report creation failed.")
-            return False
-
-        summary = {
-            "total_styles": len(final_df),
-            "total_stock":  int(final_df["STOCK"].sum()) if "STOCK" in final_df.columns else 0,
-            "series_count": final_df["SERIES"].nunique() if "SERIES" in final_df.columns else 0,
-        }
-
-        subject, body = _email_content("success", summary)
-        send_email(
-            subject, body,
-            LocalConfig.GMAIL_SENDER, LocalConfig.GMAIL_APP_PASSWORD,
-            LocalConfig.GMAIL_RECIPIENTS,
-            attachment_path=LocalConfig.OUTPUT_FILE,
-        )
-
-        logger.info("═" * 65)
-        logger.info("✅ LOCAL Pipeline completed!  Output → %s", LocalConfig.OUTPUT_FILE)
-        logger.info("═" * 65)
-        return True
-
-    except Exception:
-        logger.error("❌ Pipeline error:\n%s", traceback.format_exc())
         return False
 
 
@@ -827,8 +754,11 @@ def run_pipeline_local() -> bool:
 # ⑥ Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 def _schedule_local() -> None:
-    schedule.every().day.at(LocalConfig.SCHEDULE_TIME).do(run_pipeline_local)
-    logger.info("⏰ Scheduled: runs every day at %s IST.  Press Ctrl+C to stop.", LocalConfig.SCHEDULE_TIME)
+    schedule.every().day.at(Config.SCHEDULE_TIME).do(run_pipeline)
+    logger.info(
+        "⏰ Scheduled: runs every day at %s IST.  Press Ctrl+C to stop.",
+        Config.SCHEDULE_TIME,
+    )
     try:
         while True:
             schedule.run_pending()
@@ -839,8 +769,11 @@ def _schedule_local() -> None:
 
 if __name__ == "__main__":
     if RUN_MODE == "github":
-        sys.exit(0 if run_pipeline_github() else 1)
+        # GitHub Actions: run once and exit
+        sys.exit(0 if run_pipeline() else 1)
     elif len(sys.argv) > 1 and sys.argv[1] == "run":
-        sys.exit(0 if run_pipeline_local() else 1)
+        # Manual one-shot run
+        sys.exit(0 if run_pipeline() else 1)
     else:
+        # Default: start daily scheduler
         _schedule_local()

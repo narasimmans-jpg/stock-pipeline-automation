@@ -1,38 +1,40 @@
-name: Run Stock Pipeline
+name: Daily Stock & Pipeline Report
 
 on:
   schedule:
-    - cron: '0 5 * * *'   # 10:30 AM IST = 05:00 UTC
+    # Runs at 05:00 UTC = 10:30 IST (UTC+5:30)
+    - cron: '0 5 * * *'
+
+  # Also allows you to trigger it manually from GitHub website
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # ← fixes Node.js 20 deprecation warning
-
 jobs:
-  run-script:
+  run-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
 
     steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v4.2.2
+      # 1. Download your repo code
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5.6.0
+      # 2. Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      - name: Install Libraries
+      # 3. Install dependencies
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Script
+      # 4. Run the report script
+      #    All secrets are injected as environment variables
+      - name: Run stock pipeline report
         env:
-          RUN_MODE: github
+          EMAIL_USER:            ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD:        ${{ secrets.EMAIL_PASSWORD }}
+          RECIPIENT_EMAIL:       ${{ secrets.RECIPIENT_EMAIL }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY:       ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET:    ${{ secrets.DROPBOX_APP_SECRET }}
-          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
-          GMAIL_SENDER:          ${{ secrets.GMAIL_SENDER }}
-          GMAIL_APP_PASSWORD:    ${{ secrets.GMAIL_APP_PASSWORD }}
-          GMAIL_RECIPIENTS:      ${{ secrets.GMAIL_RECIPIENTS }}
         run: python stock_pipeline.py

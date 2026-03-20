@@ -1,779 +1,780 @@
-"""
-stock_pipeline.py
-=================
-Unified, production-ready Stock & Pipeline Analysis tool.
-
-All files are read from and written to Dropbox — no local file paths are used.
-
-Supports TWO run modes:
-  1. LOCAL  – reads/writes files via Dropbox API, schedules daily at 10:30 AM
-  2. GITHUB – downloads files from Dropbox via API, processes, uploads output,
-              sends email notification. Triggered by GitHub Actions.
-
-Mode is selected by the environment variable RUN_MODE:
-  RUN_MODE=github  → GitHub / Cloud mode  (uses env-var credentials)
-  RUN_MODE=local   → Local mode           (uses hardcoded credentials)
-  (default)        → Local mode
-
-Usage:
-  python stock_pipeline.py            # start local scheduler (runs at 10:30 AM daily)
-  python stock_pipeline.py run        # run once immediately  (local mode)
-  RUN_MODE=github python stock_pipeline.py   # GitHub Actions mode
-"""
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Imports
-# ──────────────────────────────────────────────────────────────────────────────
-import io
-import logging
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import warnings
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import os
 import smtplib
-import sys
-import time
-import traceback
-import warnings
-from datetime import datetime
-from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
-import dropbox
-import pandas as pd
+from email.mime.application import MIMEApplication
+import logging
+import sys
 import requests
-import schedule
-from dotenv import load_dotenv
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+import json
+import tempfile
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Bootstrap
-# ──────────────────────────────────────────────────────────────────────────────
-load_dotenv()
-warnings.filterwarnings("ignore")
+warnings.filterwarnings('ignore')
 
-RUN_MODE = os.getenv("RUN_MODE", "local").lower()   # "local" | "github"
+# ============================================================
+# CONFIGURATION — loaded from environment variables
+# (Set these as GitHub Actions Secrets or in your .env file)
+# ============================================================
+EMAIL_USER      = os.getenv("EMAIL_USER",      "businesssupport@technosport.in")
+EMAIL_PASSWORD  = os.getenv("EMAIL_PASSWORD",  "ctck cvix qafj dpoi")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "narasimman.s@technosport.in")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────────────────────────────────────
-_handlers = [logging.StreamHandler(sys.stdout)]
-if RUN_MODE == "local":
-    _handlers.append(logging.FileHandler("stock_pipeline.log", encoding="utf-8"))
+DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "Br_npYEnddsAAAAAAAAAAb1bLPOAv3SU8KPiqcbJYGgHY4R3Y3WdGP7BCcpe0F8h")
+DROPBOX_APP_KEY       = os.getenv("DROPBOX_APP_KEY",       "eheunxwtckkpdwk")
+DROPBOX_APP_SECRET    = os.getenv("DROPBOX_APP_SECRET",    "mo8qt53k93ov9cr")
 
+# Dropbox paths (always use forward slashes, start with /)
+DROPBOX_STOCK_PATH    = "/ODOO B2B REPORT/DATA FILE/stock_pipeline.xlsx"
+DROPBOX_PIPELINE_PATH = "/ODOO B2B REPORT/DATA FILE/pipeline1.xlsx"
+DROPBOX_OUTPUT_PATH   = "/ODOO B2B REPORT/DATA FILE/Stock_Pipeline_Analysis_Report.xlsx"
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=_handlers,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
 )
-logger = logging.getLogger(__name__)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────────────────────────────────────
-class Config:
-    """
-    Single config class for both LOCAL and GITHUB modes.
-    Credentials are hardcoded for local mode and overridden by env-vars in GitHub mode.
-    All file references are Dropbox paths — no local disk paths.
-    """
-
-    # ── Dropbox OAuth2 ───────────────────────────────────────────────
-    APP_KEY:       str = os.getenv("DROPBOX_APP_KEY",       "21xua5rf8nm6ifj")
-    APP_SECRET:    str = os.getenv("DROPBOX_APP_SECRET",    "2acad38snjh8wbn")
-    REFRESH_TOKEN: str = os.getenv("DROPBOX_REFRESH_TOKEN", "bnW7Ua14IPIAAAAAAAAAAQKVYvrgPzTUU9Hv2a89vMQKCVjh1_ff_hZza3QzJGjJ")
-
-    # ── Dropbox file paths ───────────────────────────────────────────
-    DROPBOX_STOCK_FILE:   str = "/ODOO B2B REPORT/stock_report.xlsx"
-    DROPBOX_PIPELINE_FILE: str = "/ODOO B2B REPORT/DATA FILE/Simma/pipeline1.xlsx"
-    DROPBOX_OUTPUT_FILE:  str = "/ODOO B2B REPORT/DATA FILE/Simma/Stock_Pipeline_Analysis_Report.xlsx"
-
-    # ── Gmail ────────────────────────────────────────────────────────
-    GMAIL_SENDER:       str = os.getenv("GMAIL_SENDER",       "businesssupport@technosport.in")
-    GMAIL_APP_PASSWORD: str = os.getenv("GMAIL_APP_PASSWORD", "ctck cvix qafj dpoi")
-    GMAIL_RECIPIENTS:   list = [
-        r.strip()
-        for r in os.getenv("GMAIL_RECIPIENTS", "narasimman.s@technosport.in").split(",")
-        if r.strip()
-    ]
-
-    # ── Schedule ─────────────────────────────────────────────────────
-    SCHEDULE_TIME: str = "10:30"   # 24-hour HH:MM, IST
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────────────
+# Define styles to be removed from the output
 BLANK_STYLES_TO_REMOVE = [
-    "OR23", "OR55", "OR69", "OR56", "OR66", "OR24", "OR97", "OR03",
-    "OR01A", "OR05", "OR07", "OR07B", "OR09", "OR09A", "OR12", "OR1A",
-    "OR35", "OR51", "OR57", "OR96", "SWL01", "OR81", "CR86",
+    "OR23", "OR55", "OR69", "OR56", "OR66", "OR24", "OR97", "OR03", "OR01A", "OR05",
+    "OR07", "OR07B", "OR09", "OR09A", "OR12", "OR1A", "OR35", "OR51",
+    "OR57", "OR96", "SWL01", "OR81", "CR86"
 ]
 
-SIZE_COLUMNS = [
-    "06Y/S", "08Y/M", "10Y/L", "12Y/XL", "14Y/2XL",
-    "06UK", "07UK", "08UK", "09UK", "10UK", "11UK",
-    "3XL", "4XL", "5XL", "STOCK",
-]
+# ============================================================
+# DROPBOX HELPERS
+# ============================================================
 
-COLUMN_ORDER = [
-    "SERIES", "STYLE", "CATEGORY",
-    "06Y/S", "08Y/M", "10Y/L", "12Y/XL", "14Y/2XL",
-    "06UK", "07UK", "08UK", "09UK", "10UK", "11UK",
-    "3XL", "4XL", "5XL", "STOCK", "MONTH",
-]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ① Dropbox helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def get_dropbox_client() -> dropbox.Dropbox:
-    """Exchange refresh token for a short-lived access token and return a Dropbox client."""
-    logger.info("🔑 Requesting Dropbox access token …")
-    resp = requests.post(
-        "https://api.dropbox.com/oauth2/token",
-        data={
-            "grant_type":    "refresh_token",
-            "refresh_token": Config.REFRESH_TOKEN,
-            "client_id":     Config.APP_KEY,
-            "client_secret": Config.APP_SECRET,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    token = resp.json()["access_token"]
-    logger.info("✅ Dropbox access token obtained.")
-    dbx = dropbox.Dropbox(oauth2_access_token=token)
-    dbx.users_get_current_account()
-    logger.info("✅ Dropbox connection verified.")
-    return dbx
-
-
-def download_bytes_from_dropbox(dbx: dropbox.Dropbox, dropbox_path: str) -> bytes | None:
-    """Download a file from Dropbox and return its raw bytes. Returns None on failure."""
-    try:
-        logger.info("⬇️  Downloading '%s' …", dropbox_path)
-        _, res = dbx.files_download(dropbox_path)
-        logger.info("   Downloaded %.1f KB", len(res.content) / 1024)
-        return res.content
-    except dropbox.exceptions.ApiError as exc:
-        logger.warning("⚠️  Could not download '%s': %s", dropbox_path, exc)
-        return None
-
-
-def upload_bytes_to_dropbox(dbx: dropbox.Dropbox, data: bytes, dropbox_path: str) -> None:
-    """Upload bytes to Dropbox, overwriting any existing file."""
-    logger.info("⬆️  Uploading to '%s' (%.1f KB) …", dropbox_path, len(data) / 1024)
-    dbx.files_upload(data, dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
-    logger.info("   Upload complete.")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ② Data processing
-# ──────────────────────────────────────────────────────────────────────────────
-def filter_blank_styles(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove rows whose STYLE value is in the known-blank list."""
-    if df.empty or "STYLE" not in df.columns:
-        return df
-    before = len(df)
-    bad = {s.strip() for s in BLANK_STYLES_TO_REMOVE}
-    df["STYLE"] = df["STYLE"].astype(str).str.strip()
-    df = df[~df["STYLE"].isin(bad)].copy()
-    removed = before - len(df)
-    if removed:
-        logger.info("🗑️  Removed %d blank-style rows.", removed)
-    else:
-        logger.info("ℹ️  No blank styles found to remove.")
-    return df
-
-
-def process_stock_data(file_bytes: bytes) -> pd.DataFrame:
-    """Load, normalise, filter, and aggregate the stock Excel file from bytes."""
-    logger.info("📊 Processing stock data …")
-
-    df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
-    if df.empty:
-        logger.error("❌ Stock file is empty.")
-        return pd.DataFrame()
-
-    logger.info("   Raw columns: %s", list(df.columns))
-
-    # ── Remove PACK/LFR location rows ───────────────────────────────
-    if "Location" in df.columns:
-        before = len(df)
-        df = df[~df["Location"].astype(str).str.contains("PACK/LFR", case=False, na=False)]
-        logger.info("🗑️  Removed %d PACK/LFR rows. Remaining: %d", before - len(df), len(df))
-    else:
-        logger.warning("⚠️  'Location' column not found – skipping PACK/LFR filter.")
-
-    if df.empty:
-        logger.error("❌ No data after PACK/LFR filter.")
-        return pd.DataFrame()
-
-    # ── Column rename map (lowercase key → target name) ─────────────
-    _rmap = {
-        "s":           "06Y/S",
-        "m":           "08Y/M",
-        "l":           "10Y/L",
-        "xl":          "12Y/XL",
-        "2xl":         "14Y/2XL",
-        "3xl":         "3XL",
-        "4xl":         "4XL",
-        "5xl":         "5XL",
-        "6uk":         "06UK",
-        "7uk":         "07UK",
-        "8uk":         "08UK",
-        "9uk":         "09UK",
-        "10uk":        "10UK",
-        "11uk":        "11UK",
-        "grand total": "STOCK",
-        "cat sales":   "CATEGORY",
+def get_dropbox_access_token():
+    """Get a fresh short-lived access token using the refresh token."""
+    logging.info("🔑 Refreshing Dropbox access token...")
+    url = "https://api.dropboxapi.com/oauth2/token"
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": DROPBOX_REFRESH_TOKEN,
+        "client_id": DROPBOX_APP_KEY,
+        "client_secret": DROPBOX_APP_SECRET,
     }
-    rename_dict = {}
-    for col in df.columns:
-        key = str(col).strip().lower()
-        if key in _rmap:
-            rename_dict[col] = _rmap[key]
-            logger.info("   Rename  '%s' → '%s'", col, _rmap[key])
-    df = df.rename(columns=rename_dict)
+    response = requests.post(url, data=data)
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to refresh Dropbox token: {response.text}")
+    access_token = response.json()["access_token"]
+    logging.info("✅ Dropbox access token refreshed successfully")
+    return access_token
 
-    if "STYLE" not in df.columns:
-        logger.error("❌ 'STYLE' column not found after renaming.")
-        logger.info("   Available columns: %s", list(df.columns))
-        return pd.DataFrame()
 
-    if "CATEGORY" not in df.columns:
-        logger.warning("⚠️  'CAT SALES' / 'CATEGORY' column not found – no category grouping.")
+def download_from_dropbox(access_token, dropbox_path):
+    """Download a file from Dropbox and return a local temp file path."""
+    logging.info(f"⬇️ Downloading from Dropbox: {dropbox_path}")
+    url = "https://content.dropboxapi.com/2/files/download"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Dropbox-API-Arg": json.dumps({"path": dropbox_path}),
+    }
+    response = requests.post(url, headers=headers)
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to download {dropbox_path}: {response.text}")
 
-    # ── Combine paired youth size columns ────────────────────────────
-    for old, new in [
-        ("06Y", "06Y/S"), ("08Y", "08Y/M"), ("10Y", "10Y/L"),
-        ("12Y", "12Y/XL"), ("14Y", "14Y/2XL"),
-    ]:
-        if old in df.columns and new in df.columns:
-            df[new] = df[old].fillna(0) + df[new].fillna(0)
-            df.drop(columns=[old], inplace=True)
-            logger.info("   Combined %s + %s → %s", old, new, new)
-        elif old in df.columns:
-            df.rename(columns={old: new}, inplace=True)
-            logger.info("   Renamed %s → %s", old, new)
+    suffix = os.path.splitext(dropbox_path)[1]
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(response.content)
+    tmp.close()
+    logging.info(f"✅ Downloaded to temp file: {tmp.name}")
+    return tmp.name
 
-    # ── Coerce numeric size/stock columns ───────────────────────────
-    for col in SIZE_COLUMNS:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # ── Drop empty STYLE rows ────────────────────────────────────────
-    df = df.dropna(subset=["STYLE"])
-    df = df[df["STYLE"].astype(str).str.strip() != ""]
+def upload_to_dropbox(access_token, local_path, dropbox_path):
+    """Upload a local file to Dropbox, overwriting if it exists."""
+    logging.info(f"⬆️ Uploading to Dropbox: {dropbox_path}")
+    url = "https://content.dropboxapi.com/2/files/upload"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Dropbox-API-Arg": json.dumps({
+            "path": dropbox_path,
+            "mode": "overwrite",
+            "autorename": False,
+            "mute": False,
+        }),
+        "Content-Type": "application/octet-stream",
+    }
+    with open(local_path, "rb") as f:
+        response = requests.post(url, headers=headers, data=f)
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"Failed to upload to Dropbox: {response.text}")
+    logging.info("✅ Uploaded to Dropbox successfully")
+
+
+# ============================================================
+# ORIGINAL LOGIC (unchanged)
+# ============================================================
+
+def filter_blank_styles(df):
+    """Remove specified blank styles from the dataframe"""
     if df.empty:
-        logger.error("❌ No valid STYLE data found after cleaning.")
-        return pd.DataFrame()
+        return df
 
-    # ── Aggregate by STYLE (+ CATEGORY if present) ──────────────────
-    group_cols = ["STYLE"] + (["CATEGORY"] if "CATEGORY" in df.columns else [])
-    agg_cols   = [c for c in SIZE_COLUMNS if c in df.columns]
-    df = df.groupby(group_cols)[agg_cols].sum().reset_index()
-    df = df.sort_values("STYLE", ascending=True).reset_index(drop=True)
+    initial_count = len(df)
+    df['STYLE'] = df['STYLE'].astype(str).str.strip()
+    styles_to_remove = set(style.strip() for style in BLANK_STYLES_TO_REMOVE)
+    filtered_df = df[~df['STYLE'].isin(styles_to_remove)].copy()
+    removed_count = initial_count - len(filtered_df)
 
-    logger.info("✅ Stock data processed. Shape: %s", df.shape)
-    return df
-
-
-def process_pipeline_data(file_bytes: bytes) -> pd.DataFrame:
-    """Load and summarise the pipeline Excel file from bytes."""
-    logger.info("📈 Processing pipeline data …")
-    _empty = pd.DataFrame(columns=["STYLE", "MONTH"])
-
-    df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
-    if df.empty:
-        logger.warning("⚠️  Pipeline file is empty.")
-        return _empty
-
-    logger.info("   Pipeline columns: %s", list(df.columns))
-
-    # ── Normalise STYLE column name ──────────────────────────────────
-    if "STYLE NO" in df.columns and "STYLE" not in df.columns:
-        df = df.rename(columns={"STYLE NO": "STYLE"})
-        logger.info("   Renamed 'STYLE NO' → 'STYLE'")
-    elif "STYLE NO" in df.columns:
-        df.drop(columns=["STYLE NO"], inplace=True)
-
-    if "STYLE" not in df.columns:
-        logger.error("❌ 'STYLE' column not found in pipeline data.")
-        return _empty
-
-    # ── Filter to CATALOGUE SHEET rows only ─────────────────────────
-    if "From" in df.columns:
-        df = df[df["From"].str.contains("CATALOGUE SHEET", case=False, na=False)]
-        logger.info("   Rows after CATALOGUE SHEET filter: %d", len(df))
+    if removed_count > 0:
+        logging.info(f"🗑️ Removed {removed_count} blank styles: {BLANK_STYLES_TO_REMOVE}")
+        logging.info(f"📊 Remaining styles after filtering: {len(filtered_df)}")
+        found_styles = set(df['STYLE']).intersection(styles_to_remove)
+        if found_styles:
+            logging.info(f"🔍 Specifically removed styles: {list(found_styles)}")
     else:
-        logger.warning("⚠️  'From' column not found – skipping CATALOGUE SHEET filter.")
+        logging.info("ℹ️ No blank styles found to remove")
 
-    if df.empty:
-        logger.warning("⚠️  No CATALOGUE SHEET rows found.")
-        return _empty
-
-    # ── Locate month column ──────────────────────────────────────────
-    month_col = next((c for c in df.columns if "month" in str(c).lower()), None)
-    if not month_col:
-        logger.warning("⚠️  No month column found.")
-        return _empty
-
-    # ── Locate O QTY column ─────────────────────────────────────────
-    oqty_col = next(
-        (c for c in df.columns if any(x in str(c).lower().strip() for x in ["o qty", "oqty", "o_qty"])),
-        None,
-    )
-
-    # ── Build working frame ──────────────────────────────────────────
-    keep = ["STYLE", month_col] + ([oqty_col] if oqty_col else [])
-    df   = df[keep].copy()
-    rn   = {month_col: "MONTH"}
-    if oqty_col:
-        rn[oqty_col] = "O_QTY"
-    df = df.rename(columns=rn)
-
-    if "O_QTY" in df.columns:
-        df["O_QTY"] = pd.to_numeric(df["O_QTY"], errors="coerce").fillna(0)
-
-    # ── Clean ────────────────────────────────────────────────────────
-    df = df.dropna(subset=["STYLE", "MONTH"])
-    df["STYLE"] = df["STYLE"].astype(str).str.strip()
-    df["MONTH"] = df["MONTH"].astype(str).str.strip()
-    df = df[
-        (df["STYLE"] != "") & (df["MONTH"] != "") &
-        (df["STYLE"].str.lower() != "nan") & (df["MONTH"].str.lower() != "nan")
-    ]
-    if df.empty:
-        logger.warning("⚠️  No valid pipeline rows after cleaning.")
-        return _empty
-
-    # ── Aggregate: combine months (with qty) per STYLE ───────────────
-    if "O_QTY" in df.columns:
-        grp = df.groupby(["STYLE", "MONTH"], as_index=False)["O_QTY"].sum()
-        grp["MONTH_WITH_QTY"] = grp.apply(
-            lambda r: f"{r['MONTH']}({int(r['O_QTY'])})" if r["O_QTY"] > 0 else r["MONTH"],
-            axis=1,
-        )
-        final = (
-            grp.groupby("STYLE")["MONTH_WITH_QTY"]
-            .apply(lambda x: ", ".join(sorted(set(x))))
-            .reset_index()
-        )
-        final.columns = ["STYLE", "MONTH"]
-    else:
-        final = (
-            df.groupby("STYLE")["MONTH"]
-            .apply(lambda x: ", ".join(sorted(set(x.astype(str).str.strip()))))
-            .reset_index()
-        )
-
-    logger.info("✅ Pipeline data processed. Shape: %s", final.shape)
-    return final.reset_index(drop=True)
+    return filtered_df
 
 
-def merge_and_finalize_data(stock_df: pd.DataFrame, pipeline_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge stock + pipeline, add SERIES column, reorder."""
-    logger.info("🔄 Merging data …")
-
-    if stock_df.empty:
-        logger.error("❌ No stock data to process.")
-        return pd.DataFrame()
-
-    stock_df = filter_blank_styles(stock_df)
-    if stock_df.empty:
-        logger.error("❌ No stock data after blank-style filter.")
-        return pd.DataFrame()
-
-    if not pipeline_df.empty:
-        pipeline_df = filter_blank_styles(pipeline_df)
-        stock_df["STYLE"]    = stock_df["STYLE"].astype(str).str.strip()
-        pipeline_df["STYLE"] = pipeline_df["STYLE"].astype(str).str.strip()
-        stock_df = stock_df.merge(pipeline_df, on="STYLE", how="left")
-        logger.info("   Merge complete. Rows: %d", len(stock_df))
-    else:
-        logger.warning("⚠️  No pipeline data – MONTH column will be empty.")
-        stock_df["MONTH"] = ""
-
-    stock_df["MONTH"] = stock_df["MONTH"].fillna("")
-
-    # ── Derive SERIES column ─────────────────────────────────────────
-    def _series(style: str) -> str:
-        s = str(style).strip()
-        if not s or s.lower() == "nan":
-            return "UNKNOWN-SERIES"
-        return "OR-SERIES" if s.upper().startswith("O") else f"{s[0].upper()}-SERIES"
-
-    stock_df["SERIES"] = stock_df["STYLE"].apply(_series)
-
-    # ── Reorder columns ──────────────────────────────────────────────
-    present = [c for c in COLUMN_ORDER if c in stock_df.columns]
-    final   = stock_df[present].sort_values(["SERIES", "STYLE"]).reset_index(drop=True)
-
-    logger.info("✅ Final merged data shape: %s", final.shape)
-    return final
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ③ Excel report builder  (returns bytes — never writes to disk)
-# ──────────────────────────────────────────────────────────────────────────────
-def _border(color: str = "D1D1D1") -> Border:
-    s = Side(style="thin", color=color)
-    return Border(left=s, right=s, top=s, bottom=s)
-
-
-def _hdr(cell, bg: str, fg: str = "FFFFFF") -> None:
-    cell.font      = Font(bold=True, color=fg, size=11)
-    cell.fill      = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
-    cell.alignment = Alignment(horizontal="center", vertical="center")
-    cell.border    = _border()
-
-
-def _title_row(ws, text: str, color: str, row: int = 1) -> None:
-    ws.cell(row=row, column=1, value=text)
-    c = ws.cell(row=row, column=1)
-    c.font      = Font(size=16, bold=True, color="FFFFFF")
-    c.fill      = PatternFill(start_color=color, end_color=color, fill_type="solid")
-    c.alignment = Alignment(horizontal="center", vertical="center")
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=min(max(ws.max_column, 1), 22))
-    ws.row_dimensions[row].height = 32
-
-
-def _write_df(ws, df: pd.DataFrame, start_row: int = 3,
-              hdr_color: str = "4472C4", highlight_last: bool = False) -> None:
-    """Write DataFrame into ws with alternating row colours."""
-    import math
-    ALT1, ALT2, TOTAL = "F2F2F2", "FFFFFF", "FFD966"
-
-    for c_idx, col in enumerate(df.columns, 1):
-        _hdr(ws.cell(row=start_row, column=c_idx, value=col), hdr_color)
-
-    for r_off, (_, row) in enumerate(df.iterrows(), 1):
-        r_idx    = start_row + r_off
-        is_total = highlight_last and r_off == len(df)
-        bg       = TOTAL if is_total else (ALT1 if r_off % 2 == 0 else ALT2)
-        for c_idx, val in enumerate(row, 1):
-            v    = "" if (isinstance(val, float) and math.isnan(val)) else val
-            cell = ws.cell(row=r_idx, column=c_idx, value=v)
-            cell.fill      = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
-            cell.border    = _border()
-            cell.font      = Font(size=10, bold=is_total)
-            cell.alignment = Alignment(
-                horizontal=("right" if isinstance(v, (int, float)) else "left"),
-                vertical="center",
-            )
-
-
-def _autofit(ws, df: pd.DataFrame) -> None:
-    for c_idx, col in enumerate(df.columns, 1):
-        mx = max(
-            len(str(col)),
-            *(len(str(v)) for v in df.iloc[:100, c_idx - 1] if str(v) != "nan"),
-            default=10,
-        )
-        ws.column_dimensions[get_column_letter(c_idx)].width = min(max(mx + 2, 10), 42)
-
-
-def create_excel_report_bytes(df: pd.DataFrame) -> bytes | None:
-    """Build a multi-sheet styled Excel workbook and return it as bytes."""
-    logger.info("📄 Creating Excel report in memory …")
-    if df.empty:
-        logger.error("❌ No data – cannot create report.")
-        return None
-
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    # ── Sheet 1 : Full report ────────────────────────────────────────
-    ws1 = wb.create_sheet("Stock Pipeline Report")
-    _title_row(ws1, "STOCK AND PIPELINE ANALYSIS REPORT", "366092")
-    _write_df(ws1, df, start_row=3, hdr_color="366092")
-    _autofit(ws1, df)
-
-    # ── Sheet 2 : Category summary ───────────────────────────────────
-    if "CATEGORY" in df.columns:
-        agg = [c for c in SIZE_COLUMNS if c in df.columns]
-        cdf = df.groupby("CATEGORY")[agg].sum().reset_index()
-        tot = cdf.sum(numeric_only=True)
-        tot["CATEGORY"] = "TOTAL"
-        cdf = pd.concat([cdf, pd.DataFrame([tot])], ignore_index=True)
-        ws2 = wb.create_sheet("Category Summary")
-        _title_row(ws2, "CATEGORY SALES SUMMARY", "70AD47")
-        _write_df(ws2, cdf, start_row=3, hdr_color="70AD47", highlight_last=True)
-        _autofit(ws2, cdf)
-    else:
-        logger.warning("⚠️  No CATEGORY column – skipping Category Summary sheet.")
-
-    # ── Sheet 3 : Series summary ─────────────────────────────────────
-    if "SERIES" in df.columns:
-        agg = [c for c in SIZE_COLUMNS if c in df.columns]
-        sdf = df.groupby("SERIES")[agg].sum().reset_index()
-        tot = sdf.sum(numeric_only=True)
-        tot["SERIES"] = "TOTAL"
-        sdf = pd.concat([sdf, pd.DataFrame([tot])], ignore_index=True)
-        ws3 = wb.create_sheet("Series Summary")
-        _title_row(ws3, "SERIES SUMMARY", "7030A0")
-        _write_df(ws3, sdf, start_row=3, hdr_color="7030A0", highlight_last=True)
-        _autofit(ws3, sdf)
-
-    # ── Sheet 4 : Executive summary ──────────────────────────────────
-    ws4 = wb.create_sheet("Executive Summary")
-    _title_row(ws4, "EXECUTIVE SUMMARY", "4472C4")
-
-    total_stock = int(df["STOCK"].sum())        if "STOCK"  in df.columns else 0
-    avg_stock   = round(df["STOCK"].mean(), 1)  if "STOCK"  in df.columns and len(df) else 0
-    max_stock   = int(df["STOCK"].max())        if "STOCK"  in df.columns else 0
-    min_stock   = int(df["STOCK"].min())        if "STOCK"  in df.columns else 0
-    n_series    = df["SERIES"].nunique()        if "SERIES" in df.columns else "N/A"
-    n_pipeline  = int((df["MONTH"] != "").sum()) if "MONTH" in df.columns else 0
-
-    kpis = [
-        ["Metric",                        "Value"],
-        ["Total Styles",                  len(df)],
-        ["Total Stock Units",             total_stock],
-        ["Number of Series",              n_series],
-        ["Average Stock per Style",       avg_stock],
-        ["Maximum Stock (Single Style)",  max_stock],
-        ["Minimum Stock (Single Style)",  min_stock],
-        ["Styles with Pipeline Month",    n_pipeline],
-        ["Report Generated (IST)",        datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-    ]
-
-    for r, row_data in enumerate(kpis, 3):
-        for c, val in enumerate(row_data, 1):
-            cell = ws4.cell(row=r, column=c, value=val)
-            if r == 3:
-                _hdr(cell, "4472C4")
-            else:
-                cell.fill      = PatternFill(start_color="F8F9FA", end_color="F8F9FA", fill_type="solid")
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-                cell.border    = _border()
-
-    ws4.column_dimensions["A"].width = 38
-    ws4.column_dimensions["B"].width = 30
-
-    # ── Timestamp footer ─────────────────────────────────────────────
-    ts = datetime.now().strftime("Generated on %Y-%m-%d at %H:%M:%S IST")
-    for ws in wb:
-        try:
-            ws.cell(row=ws.max_row + 2, column=1, value=ts).font = Font(italic=True, color="808080")
-        except Exception:
-            pass
-
-    # ── Save to bytes buffer ─────────────────────────────────────────
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    data = buf.read()
-    logger.info("✅ Excel report created in memory (%.1f KB).", len(data) / 1024)
-    return data
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ④ Email notification
-# ──────────────────────────────────────────────────────────────────────────────
-def _email_content(status: str, summary: dict | None, error: str = "") -> tuple:
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if status == "success" and summary:
-        subject = "✅ Stock Pipeline Completed Successfully"
-        body = f"""Hello Team,
-
-Please find attached the Stock and Pipeline Analysis Report.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Run Time     : {ts} (IST)
-  Total Styles : {summary.get('total_styles', 'N/A'):,}
-  Total Stock  : {summary.get('total_stock', 'N/A'):,}
-  Series Count : {summary.get('series_count', 'N/A')}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-The output file has also been uploaded back to Dropbox.
-
-This is an automated report. Contact IT if you have any issues.
-
-Best regards,
-Automated Reporting System"""
-    else:
-        subject = "❌ Stock Pipeline FAILED"
-        body = f"""Hello Team,
-
-The Stock Pipeline encountered an error and did not complete successfully.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Run Time : {ts} (IST)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Error Details:
-{error or 'Unknown error – check the logs.'}
-
-Please check the logs for the full traceback.
-
-Best regards,
-Automated Reporting System"""
-    return subject, body
-
-
-def send_email(
-    subject: str,
-    body: str,
-    sender: str,
-    password: str,
-    recipients: list,
-    attachment_bytes: bytes = b"",
-    attachment_name: str = "",
-) -> bool:
-    """Send an email via Gmail SMTP with an optional in-memory Excel attachment."""
-    recipients = [r.strip() for r in recipients if r.strip()]
-    if not recipients:
-        logger.error("❌ No valid email recipients.")
-        return False
-
-    logger.info("✉️  Sending email to: %s", recipients)
-    msg            = MIMEMultipart()
-    msg["From"]    = sender
-    msg["To"]      = ", ".join(recipients)
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    if attachment_bytes and attachment_name:
-        part = MIMEApplication(attachment_bytes, Name=attachment_name)
-        part["Content-Disposition"] = f'attachment; filename="{attachment_name}"'
-        msg.attach(part)
+def process_stock_data(stock_file_path):
+    """Process stock data with robust column matching"""
+    logging.info("📊 Processing Stock Data...")
 
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as srv:
-            srv.starttls()
-            srv.login(sender, password)
-            srv.sendmail(sender, recipients, msg.as_string())
-        logger.info("✅ Email sent successfully.")
-        return True
-    except Exception as exc:
-        logger.error("❌ Email failed: %s", exc)
-        return False
+        if not os.path.exists(stock_file_path):
+            logging.error(f"❌ Stock file not found: {stock_file_path}")
+            return pd.DataFrame()
 
+        stock_df = pd.read_excel(stock_file_path)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ⑤ Core pipeline  (shared by both modes)
-# ──────────────────────────────────────────────────────────────────────────────
-def run_pipeline() -> bool:
-    """
-    Main pipeline logic:
-      Authenticate Dropbox → Download files → Process → Build report →
-      Upload output to Dropbox → Send email with attachment
-    Everything is done in memory — no local disk I/O.
-    """
-    logger.info("═" * 65)
-    logger.info(
-        "🚀 PIPELINE START [%s mode] – %s IST",
-        RUN_MODE.upper(),
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    )
-    logger.info("═" * 65)
-
-    summary = None
-    report_bytes = b""
-
-    try:
-        # 1. Authenticate Dropbox
-        dbx = get_dropbox_client()
-
-        # 2. Download stock file (mandatory)
-        stock_bytes = download_bytes_from_dropbox(dbx, Config.DROPBOX_STOCK_FILE)
-        if stock_bytes is None:
-            raise FileNotFoundError(f"Stock file unavailable on Dropbox: {Config.DROPBOX_STOCK_FILE}")
-
-        # 3. Download pipeline file (optional)
-        pipeline_bytes = download_bytes_from_dropbox(dbx, Config.DROPBOX_PIPELINE_FILE)
-        if pipeline_bytes is None:
-            logger.warning("⚠️  Pipeline file unavailable – continuing without it.")
-
-        # 4. Process data
-        stock_df = process_stock_data(stock_bytes)
         if stock_df.empty:
-            raise ValueError("Stock data processing returned empty DataFrame.")
+            logging.error("❌ Stock file is empty")
+            return pd.DataFrame()
 
-        pipeline_df = (
-            process_pipeline_data(pipeline_bytes)
-            if pipeline_bytes is not None
-            else pd.DataFrame(columns=["STYLE", "MONTH"])
-        )
+        original_columns = [str(col).strip() for col in stock_df.columns]
+        logging.info(f"🔍 Columns found: {original_columns}")
 
-        final_df = merge_and_finalize_data(stock_df, pipeline_df)
-        if final_df.empty:
-            raise ValueError("Merged final data is empty.")
+        if 'Location' in stock_df.columns:
+            initial_rows = len(stock_df)
+            stock_df = stock_df[~stock_df['Location'].astype(str).str.contains('PACK/LFR', case=False, na=False)]
+            filtered_rows = initial_rows - len(stock_df)
+            logging.info(f"🗑️ Filtered out {filtered_rows} rows with Location='PACK/LFR'")
+            logging.info(f"📊 Remaining rows: {len(stock_df)}")
+        else:
+            logging.warning("⚠️ 'Location' column not found - skipping PACK/LFR filter")
 
-        # 5. Build Excel report (in memory)
-        report_bytes = create_excel_report_bytes(final_df)
-        if not report_bytes:
-            raise RuntimeError("Excel report creation failed.")
+        if stock_df.empty:
+            logging.error("❌ No data remaining after filtering PACK/LFR locations")
+            return pd.DataFrame()
 
-        summary = {
-            "total_styles": len(final_df),
-            "total_stock":  int(final_df["STOCK"].sum()) if "STOCK" in final_df.columns else 0,
-            "series_count": final_df["SERIES"].nunique() if "SERIES" in final_df.columns else 0,
+        column_mapping = {
+            's': '06Y/S',
+            'm': '08Y/M',
+            'l': '10Y/L',
+            'xl': '12Y/XL',
+            '2xl': '14Y/2XL',
+            '3xl': '3XL',
+            '4xl': '4XL',
+            '5xl': '5XL',
+            '6uk': '06UK',
+            '7uk': '07UK',
+            '8uk': '08UK',
+            '9uk': '09UK',
+            '10uk': '10UK',
+            '11uk': '11UK',
+            'grand total': 'STOCK',
+            'cat sales': 'CATEGORY'
         }
 
-        # 6. Upload output back to Dropbox
-        upload_bytes_to_dropbox(dbx, report_bytes, Config.DROPBOX_OUTPUT_FILE)
+        rename_dict = {}
+        for col in stock_df.columns:
+            normalized_col = str(col).strip().lower()
+            if normalized_col in column_mapping:
+                rename_dict[col] = column_mapping[normalized_col]
+                logging.info(f"✅ Renaming column: '{col}'➡️ '{column_mapping[normalized_col]}'")
 
-        # 7. Email success with attachment
-        subject, body = _email_content("success", summary)
-        send_email(
-            subject, body,
-            Config.GMAIL_SENDER, Config.GMAIL_APP_PASSWORD,
-            Config.GMAIL_RECIPIENTS,
-            attachment_bytes=report_bytes,
-            attachment_name="Stock_Pipeline_Analysis_Report.xlsx",
+        df = stock_df.rename(columns=rename_dict)
+
+        if 'CATEGORY' not in df.columns:
+            logging.warning("⚠️ 'CAT SALES' column not found after renaming.")
+        else:
+            logging.info("✅ CAT SALES column found and renamed to CATEGORY")
+
+        size_mappings = [
+            ('06Y', '06Y/S'),
+            ('08Y', '08Y/M'),
+            ('10Y', '10Y/L'),
+            ('12Y', '12Y/XL'),
+            ('14Y', '14Y/2XL')
+        ]
+
+        for old_col, new_col in size_mappings:
+            if old_col in df.columns and new_col in df.columns:
+                df[new_col] = df[old_col].fillna(0) + df[new_col].fillna(0)
+                df = df.drop(columns=[old_col])
+                logging.info(f"✅ Combined columns: {old_col} + {new_col}")
+            elif old_col in df.columns:
+                df = df.rename(columns={old_col: new_col})
+                logging.info(f"✅ Renamed column: {old_col} ➡️ {new_col}")
+
+        numeric_columns = ['06Y/S', '08Y/M', '10Y/L', '12Y/XL', '14Y/2XL',
+                           '06UK', '07UK', '08UK', '09UK', '10UK', '11UK',
+                           '3XL', '4XL', '5XL', 'STOCK']
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+        group_cols = ['STYLE']
+        if 'CATEGORY' in df.columns:
+            group_cols.append('CATEGORY')
+
+        if 'STYLE' not in df.columns:
+            logging.error("❌ STYLE column not found in stock data")
+            return pd.DataFrame()
+
+        df = df.dropna(subset=['STYLE'])
+        df = df[df['STYLE'].astype(str).str.strip() != '']
+
+        if df.empty:
+            logging.error("❌ No valid STYLE data found after cleaning")
+            return pd.DataFrame()
+
+        existing_numeric_cols = [col for col in numeric_columns if col in df.columns]
+        df_grouped = df.groupby(group_cols)[existing_numeric_cols].sum().reset_index()
+        df_grouped = df_grouped.sort_values('STYLE', ascending=True)
+
+        logging.info(f"✅ Stock data processed successfully! Shape: {df_grouped.shape}")
+        return df_grouped
+
+    except Exception as e:
+        logging.error(f"❌ Error processing stock data: {str(e)}", exc_info=True)
+        return pd.DataFrame()
+
+
+def process_pipeline_data(pipeline_file_path):
+    """Process pipeline data according to requirements"""
+    logging.info("📈 Processing Pipeline Data...")
+
+    try:
+        if not os.path.exists(pipeline_file_path):
+            logging.warning(f"⚠️ Pipeline file not found: {pipeline_file_path}")
+            return pd.DataFrame(columns=['STYLE', 'MONTH'])
+
+        pipeline_df = pd.read_excel(pipeline_file_path)
+
+        if pipeline_df.empty:
+            logging.warning("⚠️ Pipeline file is empty")
+            return pd.DataFrame(columns=['STYLE', 'MONTH'])
+
+        original_columns = [str(col).strip() for col in pipeline_df.columns]
+        logging.info(f"🔍 Pipeline columns found: {original_columns}")
+
+        if 'STYLE NO' in pipeline_df.columns and 'STYLE' not in pipeline_df.columns:
+            pipeline_df = pipeline_df.rename(columns={'STYLE NO': 'STYLE'})
+            logging.info("✅ Renamed 'STYLE NO' to 'STYLE'")
+        elif 'STYLE NO' in pipeline_df.columns and 'STYLE' in pipeline_df.columns:
+            pipeline_df = pipeline_df.drop(columns=['STYLE NO'])
+
+        if 'From' in pipeline_df.columns:
+            pipeline_df = pipeline_df[pipeline_df['From'].str.contains('CATALOGUE SHEET', na=False, case=False)]
+            logging.info(f"📊 Pipeline data after filtering: {len(pipeline_df)} rows")
+        else:
+            logging.warning("⚠️ 'From' column not found in pipeline data")
+
+        if len(pipeline_df) == 0:
+            logging.warning("⚠️ No rows found with 'CATALOGUE SHEET' in From column")
+            return pd.DataFrame(columns=['STYLE', 'MONTH'])
+
+        if 'STYLE' not in pipeline_df.columns:
+            logging.error("❌ STYLE column not found")
+            return pd.DataFrame(columns=['STYLE', 'MONTH'])
+
+        month_col = None
+        for col in pipeline_df.columns:
+            if 'month' in col.lower():
+                month_col = col
+                break
+
+        if not month_col:
+            logging.warning("⚠️ No month column found")
+            return pd.DataFrame(columns=['STYLE', 'MONTH'])
+
+        oqty_col = None
+        for col in pipeline_df.columns:
+            col_lower = col.lower().strip()
+            if 'o qty' in col_lower or 'oqty' in col_lower or 'o_qty' in col_lower:
+                oqty_col = col
+                break
+
+        if not oqty_col:
+            pipeline_df = pipeline_df[['STYLE', month_col]].copy()
+            pipeline_df = pipeline_df.rename(columns={month_col: 'MONTH'})
+        else:
+            pipeline_df = pipeline_df[['STYLE', month_col, oqty_col]].copy()
+            pipeline_df = pipeline_df.rename(columns={month_col: 'MONTH', oqty_col: 'O_QTY'})
+            pipeline_df['O_QTY'] = pd.to_numeric(pipeline_df['O_QTY'], errors='coerce').fillna(0)
+
+        pipeline_df = pipeline_df.dropna(subset=['STYLE', 'MONTH'])
+        pipeline_df['STYLE'] = pipeline_df['STYLE'].astype(str).str.strip()
+        pipeline_df['MONTH'] = pipeline_df['MONTH'].astype(str).str.strip()
+        pipeline_df = pipeline_df[
+            (pipeline_df['STYLE'] != '') &
+            (pipeline_df['MONTH'] != '') &
+            (pipeline_df['STYLE'].str.lower() != 'nan') &
+            (pipeline_df['MONTH'].str.lower() != 'nan')
+        ]
+
+        if pipeline_df.empty:
+            logging.warning("⚠️ No valid pipeline data after cleaning")
+            return pd.DataFrame(columns=['STYLE', 'MONTH'])
+
+        if 'O_QTY' in pipeline_df.columns:
+            grouped_df = pipeline_df.groupby(['STYLE', 'MONTH'], as_index=False)['O_QTY'].sum()
+            grouped_df['MONTH_WITH_QTY'] = grouped_df.apply(
+                lambda row: f"{row['MONTH']}({int(row['O_QTY'])})" if row['O_QTY'] > 0 else row['MONTH'],
+                axis=1
+            )
+            final_df = grouped_df.groupby('STYLE')['MONTH_WITH_QTY'].apply(
+                lambda x: ', '.join(sorted(set(x)))
+            ).reset_index()
+            final_df.columns = ['STYLE', 'MONTH']
+        else:
+            final_df = pipeline_df.groupby('STYLE')['MONTH'].apply(
+                lambda x: ', '.join(sorted(set(x.astype(str).str.strip())))
+            ).reset_index()
+
+        final_df = final_df.reset_index(drop=True)
+        logging.info(f"✅ Pipeline data processed! Shape: {final_df.shape}")
+        return final_df
+
+    except Exception as e:
+        logging.error(f"❌ Error processing pipeline data: {str(e)}", exc_info=True)
+        return pd.DataFrame(columns=['STYLE', 'MONTH'])
+
+
+def merge_and_finalize_data(stock_df, pipeline_df):
+    """Merge stock and pipeline data and create final output"""
+    logging.info("🔄 Merging and finalizing data...")
+
+    try:
+        if stock_df.empty:
+            logging.error("❌ No stock data to process")
+            return pd.DataFrame()
+
+        stock_df = filter_blank_styles(stock_df)
+
+        if stock_df.empty:
+            logging.error("❌ No stock data remaining after filtering blank styles")
+            return pd.DataFrame()
+
+        if len(pipeline_df) == 0:
+            logging.warning("⚠️ No pipeline data to merge")
+            stock_df['MONTH'] = ''
+        else:
+            pipeline_df = filter_blank_styles(pipeline_df)
+            stock_df['STYLE'] = stock_df['STYLE'].astype(str).str.strip()
+            pipeline_df['STYLE'] = pipeline_df['STYLE'].astype(str).str.strip()
+            try:
+                stock_df = stock_df.merge(pipeline_df, on='STYLE', how='left')
+                logging.info(f"✅ Merge completed. Rows: {len(stock_df)}")
+            except Exception as e:
+                logging.warning(f"⚠️ Error during merge: {e}")
+                stock_df['MONTH'] = ''
+
+        stock_df['MONTH'] = stock_df['MONTH'].fillna('')
+
+        def create_series(style):
+            if pd.isna(style) or style == '' or str(style).lower() == 'nan':
+                return 'UNKNOWN-SERIES'
+            style_str = str(style).strip()
+            if len(style_str) == 0:
+                return 'UNKNOWN-SERIES'
+            if style_str.upper().startswith('O'):
+                return 'OR-SERIES'
+            else:
+                return f"{style_str[0].upper()}-SERIES"
+
+        stock_df['SERIES'] = stock_df['STYLE'].apply(create_series)
+
+        column_order = ['SERIES', 'STYLE', '06Y/S', '08Y/M', '10Y/L', '12Y/XL', '14Y/2XL',
+                        '06UK', '07UK', '08UK', '09UK', '10UK', '11UK',
+                        '3XL', '4XL', '5XL', 'STOCK', 'MONTH']
+        if 'CATEGORY' in stock_df.columns:
+            column_order.insert(2, 'CATEGORY')
+
+        existing_columns = [col for col in column_order if col in stock_df.columns]
+        final_df = stock_df[existing_columns].copy()
+        final_df = final_df.sort_values(['SERIES', 'STYLE']).reset_index(drop=True)
+
+        logging.info(f"📊 Final data shape: {final_df.shape}")
+        logging.info("✅ Data merged and finalized successfully!")
+        return final_df
+
+    except Exception as e:
+        logging.error(f"❌ Error merging data: {str(e)}", exc_info=True)
+        return pd.DataFrame()
+
+
+def style_worksheet(ws, title, start_row=1, color='366092'):
+    try:
+        ws.cell(row=start_row, column=1, value=title)
+        title_cell = ws.cell(row=start_row, column=1)
+        title_cell.font = Font(size=16, bold=True, color='FFFFFF')
+        title_cell.fill = PatternFill(start_color=color, end_color=color, fill_type='solid')
+        title_cell.alignment = Alignment(horizontal='center', vertical='center')
+        max_col = max(ws.max_column, 1)
+        max_col = min(max_col, 12)
+        ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=max_col)
+        ws.row_dimensions[start_row].height = 30
+    except Exception as e:
+        logging.warning(f"⚠️ Error styling worksheet: {e}")
+
+
+def apply_table_formatting(ws, df, start_row=3, highlight_totals=False):
+    try:
+        header_color = '4472C4'
+        header_font_color = 'FFFFFF'
+        alternating_color1 = 'F2F2F2'
+        alternating_color2 = 'FFFFFF'
+        totals_color = 'FFD966'
+        border_color = 'D1D1D1'
+
+        thin_border = Border(
+            left=Side(style='thin', color=border_color),
+            right=Side(style='thin', color=border_color),
+            top=Side(style='thin', color=border_color),
+            bottom=Side(style='thin', color=border_color)
         )
 
-        logger.info("═" * 65)
-        logger.info("✅ Pipeline completed successfully!")
-        logger.info("   Dropbox output → %s", Config.DROPBOX_OUTPUT_FILE)
-        logger.info("═" * 65)
+        for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True), start_row):
+            for c_idx, value in enumerate(row, 1):
+                ws.cell(row=r_idx, column=c_idx, value=value)
+
+        for col_idx, col_name in enumerate(df.columns, 1):
+            cell = ws.cell(row=start_row, column=col_idx)
+            cell.font = Font(bold=True, color=header_font_color, size=11)
+            cell.fill = PatternFill(start_color=header_color, end_color=header_color, fill_type='solid')
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = thin_border
+
+        for row_idx in range(start_row + 1, start_row + 1 + len(df)):
+            is_totals_row = highlight_totals and (row_idx == start_row + len(df))
+            if is_totals_row:
+                fill_color = totals_color
+            else:
+                fill_color = alternating_color1 if (row_idx - start_row) % 2 == 0 else alternating_color2
+
+            for col_idx in range(1, len(df.columns) + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                if cell.value is None:
+                    cell.value = ""
+                elif isinstance(cell.value, (int, float)):
+                    cell.alignment = Alignment(horizontal='right', vertical='center')
+                else:
+                    cell.alignment = Alignment(horizontal='left', vertical='center')
+                cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type='solid')
+                cell.border = thin_border
+                cell.font = Font(size=10, bold=is_totals_row)
+
+    except Exception as e:
+        logging.warning(f"⚠️ Error applying table formatting: {e}")
+
+
+def adjust_column_widths(ws, df, start_row=3):
+    try:
+        for col_idx, col_name in enumerate(df.columns, 1):
+            column_letter = get_column_letter(col_idx)
+            max_length = len(str(col_name))
+            sample_size = min(len(df), 100)
+            for row_idx in range(sample_size):
+                try:
+                    cell_value = df.iloc[row_idx, col_idx - 1]
+                    if pd.notna(cell_value):
+                        cell_length = len(str(cell_value))
+                        if cell_length > max_length:
+                            max_length = cell_length
+                except:
+                    continue
+            adjusted_width = min(max(max_length + 2, 10), 40)
+            ws.column_dimensions[column_letter].width = adjusted_width
+    except Exception as e:
+        logging.warning(f"⚠️ Error adjusting column widths: {e}")
+
+
+def create_excel_report(df, output_file):
+    """Create a clean Excel report with well-formatted tables"""
+    logging.info("📊 Creating Excel report...")
+
+    try:
+        if df.empty:
+            logging.error("❌ Cannot create report: No data available")
+            return False
+
+        output_dir = os.path.dirname(output_file)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        wb = Workbook()
+        wb.remove(wb.active)
+
+        data_ws = wb.create_sheet(title="Stock Pipeline Report")
+        style_worksheet(data_ws, "STOCK AND PIPELINE ANALYSIS REPORT", color='366092')
+        apply_table_formatting(data_ws, df, start_row=3)
+        adjust_column_widths(data_ws, df, start_row=3)
+
+        if 'CATEGORY' in df.columns:
+            category_ws = wb.create_sheet(title="Category Summary")
+            style_worksheet(category_ws, "CATEGORY SALES SUMMARY", color='70AD47')
+
+            size_cols = ['06Y/S', '08Y/M', '10Y/L', '12Y/XL', '14Y/2XL',
+                         '06UK', '07UK', '08UK', '09UK', '10UK', '11UK',
+                         '3XL', '4XL', '5XL', 'STOCK']
+            size_cols = [col for col in size_cols if col in df.columns]
+
+            if size_cols:
+                category_df = df.groupby('CATEGORY')[size_cols].sum().reset_index()
+                totals = category_df.sum(numeric_only=True)
+                totals['CATEGORY'] = 'TOTAL'
+                category_df = pd.concat([category_df, pd.DataFrame([totals])], ignore_index=True)
+                apply_table_formatting(category_ws, category_df, start_row=3, highlight_totals=True)
+                adjust_column_widths(category_ws, category_df, start_row=3)
+
+        summary_ws = wb.create_sheet(title="Executive Summary")
+        style_worksheet(summary_ws, "EXECUTIVE SUMMARY", color='4472C4')
+
+        total_stock = int(df['STOCK'].sum()) if 'STOCK' in df.columns else 0
+        avg_stock   = int(df['STOCK'].mean()) if 'STOCK' in df.columns and len(df) > 0 else 0
+        max_stock   = int(df['STOCK'].max()) if 'STOCK' in df.columns else 0
+        min_stock   = int(df['STOCK'].min()) if 'STOCK' in df.columns else 0
+
+        summary_data = [
+            ["Metric", "Value"],
+            ["Total Styles", len(df)],
+            ["Total Stock", total_stock],
+            ["Number of Series", df['SERIES'].nunique() if 'SERIES' in df.columns else 0],
+            ["Average Stock per Style", avg_stock],
+            ["Maximum Stock (Single Style)", max_stock],
+            ["Minimum Stock (Single Style)", min_stock]
+        ]
+
+        for r_idx, row in enumerate(summary_data, 3):
+            for c_idx, value in enumerate(row, 1):
+                cell = summary_ws.cell(row=r_idx, column=c_idx, value=value)
+                if r_idx == 3:
+                    cell.font = Font(bold=True, color='FFFFFF')
+                    cell.fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+                else:
+                    cell.fill = PatternFill(start_color='F8F9FA', end_color='F8F9FA', fill_type='solid')
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = Border(
+                    left=Side(style='thin'), right=Side(style='thin'),
+                    top=Side(style='thin'), bottom=Side(style='thin')
+                )
+
+        if 'SERIES' in df.columns and 'STOCK' in df.columns:
+            summary_ws.cell(row=11, column=1, value="Series Breakdown").font = Font(bold=True, size=14)
+            series_summary = df.groupby('SERIES').agg({'STYLE': 'count', 'STOCK': 'sum'}).reset_index()
+            series_summary.columns = ['Series', 'Style Count', 'Total Stock']
+
+            for c_idx, header in enumerate(["Series", "Style Count", "Total Stock"], 1):
+                cell = summary_ws.cell(row=12, column=c_idx, value=header)
+                cell.font = Font(bold=True, color='FFFFFF')
+                cell.fill = PatternFill(start_color='70AD47', end_color='70AD47', fill_type='solid')
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = Border(
+                    left=Side(style='thin'), right=Side(style='thin'),
+                    top=Side(style='thin'), bottom=Side(style='thin')
+                )
+
+            for r_idx, (_, row) in enumerate(series_summary.iterrows(), 13):
+                for c_idx, value in enumerate(row, 1):
+                    cell = summary_ws.cell(row=r_idx, column=c_idx,
+                                           value=int(value) if isinstance(value, (int, float)) else value)
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                    cell.fill = PatternFill(start_color='F8F9FA', end_color='F8F9FA', fill_type='solid')
+                    cell.border = Border(
+                        left=Side(style='thin'), right=Side(style='thin'),
+                        top=Side(style='thin'), bottom=Side(style='thin')
+                    )
+
+        for col_num in range(1, 4):
+            summary_ws.column_dimensions[get_column_letter(col_num)].width = 25
+
+        timestamp = datetime.now().strftime("Generated on %Y-%m-%d at %H:%M:%S")
+        for sheet in wb:
+            try:
+                sheet.cell(row=sheet.max_row + 2, column=1, value=timestamp).font = Font(italic=True, color='808080')
+            except:
+                pass
+
+        wb.save(output_file)
+        logging.info(f"✅ Excel report created: {output_file}")
         return True
 
-    except Exception:
-        err = traceback.format_exc()
-        logger.error("❌ Pipeline failed:\n%s", err)
-        try:
-            subject, body = _email_content("failure", None, error=err)
-            send_email(
-                subject, body,
-                Config.GMAIL_SENDER, Config.GMAIL_APP_PASSWORD,
-                Config.GMAIL_RECIPIENTS,
-            )
-        except Exception as mail_err:
-            logger.error("❌ Could not send failure email: %s", mail_err)
+    except Exception as e:
+        logging.error(f"❌ Error creating Excel report: {e}", exc_info=True)
         return False
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ⑥ Entry point
-# ──────────────────────────────────────────────────────────────────────────────
-def _schedule_local() -> None:
-    schedule.every().day.at(Config.SCHEDULE_TIME).do(run_pipeline)
-    logger.info(
-        "⏰ Scheduled: runs every day at %s IST.  Press Ctrl+C to stop.",
-        Config.SCHEDULE_TIME,
-    )
+def send_email(subject, body, to_emails, attachment_path=None):
+    """Send email with optional attachment"""
+    logging.info(f"✉️ Sending email...")
+
+    sender_email    = EMAIL_USER
+    sender_password = EMAIL_PASSWORD
+    smtp_server     = "smtp.gmail.com"
+    smtp_port       = 587
+
+    if isinstance(to_emails, str):
+        recipient_list = [e.strip() for e in to_emails.split(',') if e.strip()]
+    else:
+        recipient_list = to_emails
+    recipient_list = [e for e in recipient_list if e and e.strip()]
+
+    if not recipient_list:
+        logging.error("❌ No valid email recipients found")
+        return False
+
     try:
-        while True:
-            schedule.run_pending()
-            time.sleep(30)
-    except KeyboardInterrupt:
-        logger.info("🛑 Scheduler stopped by user.")
+        msg = MIMEMultipart()
+        msg['From']    = sender_email
+        msg['To']      = ", ".join(recipient_list)
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        if attachment_path and os.path.exists(attachment_path):
+            with open(attachment_path, 'rb') as attachment:
+                part = MIMEApplication(attachment.read(), Name=os.path.basename(attachment_path))
+            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(attachment_path)}"'
+            msg.attach(part)
+        elif attachment_path:
+            logging.warning(f"⚠️ Attachment not found: {attachment_path}")
+
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, recipient_list, msg.as_string())
+
+        logging.info(f"✅ Email sent to {len(recipient_list)} recipient(s)!")
+        return True
+
+    except Exception as e:
+        logging.error(f"❌ Failed to send email: {str(e)}", exc_info=True)
+        return False
+
+
+# ============================================================
+# MAIN RUN FUNCTION
+# ============================================================
+
+def run_report():
+    """Main function — downloads files from Dropbox, processes, uploads result, sends email."""
+    logging.info("🚀 Starting Stock and Pipeline Analysis")
+    logging.info("=" * 60)
+
+    tmp_stock    = None
+    tmp_pipeline = None
+    tmp_output   = None
+
+    try:
+        # 1. Get fresh Dropbox token
+        access_token = get_dropbox_access_token()
+
+        # 2. Download input files from Dropbox to temp files
+        tmp_stock = download_from_dropbox(access_token, DROPBOX_STOCK_PATH)
+
+        try:
+            tmp_pipeline = download_from_dropbox(access_token, DROPBOX_PIPELINE_PATH)
+        except Exception as e:
+            logging.warning(f"⚠️ Could not download pipeline file: {e} — continuing without it")
+            tmp_pipeline = None
+
+        # 3. Create a temp path for the output Excel
+        tmp_output_file = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+        tmp_output_file.close()
+        tmp_output = tmp_output_file.name
+
+        # 4. Process data
+        stock_data = process_stock_data(tmp_stock)
+        if stock_data.empty:
+            logging.error("❌ Aborting: Stock data processing failed")
+            return False
+
+        pipeline_data = process_pipeline_data(tmp_pipeline) if tmp_pipeline else pd.DataFrame(columns=['STYLE', 'MONTH'])
+        final_data    = merge_and_finalize_data(stock_data, pipeline_data)
+
+        if final_data.empty:
+            logging.error("❌ Aborting: No final data to report")
+            return False
+
+        # 5. Create Excel report locally (temp file)
+        success = create_excel_report(final_data, tmp_output)
+        if not success:
+            logging.error("❌ Failed to generate report")
+            return False
+
+        # 6. Upload result back to Dropbox
+        upload_to_dropbox(access_token, tmp_output, DROPBOX_OUTPUT_PATH)
+
+        # 7. Send email with the report as attachment
+        recipient_emails = [e.strip() for e in RECIPIENT_EMAIL.split(',') if e.strip()]
+
+        email_subject = "Daily Stock and Pipeline Analysis Report"
+        email_body = """Hello Team,
+
+Please find attached the daily Stock and Pipeline Analysis Report.
+
+Key highlights:
+- Total Styles: {styles:,}
+- Total Stock: {stock:,}
+- Number of Series: {series}
+- Report generated at: {timestamp}
+
+This is an automated report. Please contact the IT team if you have any issues.
+
+Best regards,
+Automated Reporting System""".format(
+            styles=len(final_data),
+            stock=int(final_data['STOCK'].sum()) if 'STOCK' in final_data.columns else 0,
+            series=final_data['SERIES'].nunique() if 'SERIES' in final_data.columns else 0,
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+
+        send_success = send_email(
+            subject=email_subject,
+            body=email_body,
+            to_emails=recipient_emails,
+            attachment_path=tmp_output
+        )
+
+        if send_success:
+            logging.info("✅ Report generated and sent successfully!")
+            return True
+        else:
+            logging.error("❌ Report generated but failed to send email")
+            return False
+
+    except Exception as e:
+        logging.error(f"❌ Error in report execution: {e}", exc_info=True)
+        return False
+
+    finally:
+        # Clean up temp files
+        for tmp_path in [tmp_stock, tmp_pipeline, tmp_output]:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except:
+                    pass
+        logging.info("=" * 60)
 
 
 if __name__ == "__main__":
-    if RUN_MODE == "github":
-        # GitHub Actions: run once and exit
-        sys.exit(0 if run_pipeline() else 1)
-    elif len(sys.argv) > 1 and sys.argv[1] == "run":
-        # Manual one-shot run
-        sys.exit(0 if run_pipeline() else 1)
-    else:
-        # Default: start daily scheduler
-        _schedule_local()
+    success = run_report()
+    sys.exit(0 if success else 1)

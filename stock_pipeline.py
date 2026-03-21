@@ -27,7 +27,7 @@ EMAIL_USER      = os.getenv("EMAIL_USER",      "businesssupport@technosport.in")
 EMAIL_PASSWORD  = os.getenv("EMAIL_PASSWORD",  "ctck cvix qafj dpoi")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "narasimman.s@technosport.in")
 
-DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "Br_npYEnddsAAAAAAAAAAb1bLPOAv3SU8KPiqcbJYGgHY4R3Y3WdGP7BCcpe0F8h")
+DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "asq7aMXgDmUAAAAAAAAAATr7qKk25z4pJStR0dsJMU1DwMNnbCByDmrH4T1u2XlB")
 DROPBOX_APP_KEY       = os.getenv("DROPBOX_APP_KEY",       "eheunxwtckkpdwk")
 DROPBOX_APP_SECRET    = os.getenv("DROPBOX_APP_SECRET",    "mo8qt53k93ov9cr")
 

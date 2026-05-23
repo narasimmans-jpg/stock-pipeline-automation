@@ -648,22 +648,18 @@ def send_email(subject, body, to_emails, attachment_path=None):
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
 
-if attachment_path and os.path.exists(attachment_path):
-
-    # CUSTOM EXCEL FILE NAME
-    excel_filename = "STOCK_PIPELINE.xlsx"
-
-    with open(attachment_path, 'rb') as attachment:
-        part = MIMEApplication(
-            attachment.read(),
-            Name=excel_filename
-        )
-
-    part['Content-Disposition'] = (
-        f'attachment; filename="{excel_filename}"'
-    )
-
-    msg.attach(part)
+        if attachment_path and os.path.exists(attachment_path):
+            # CUSTOM EXCEL FILE NAME
+            excel_filename = "STOCK_PIPELINE.xlsx"
+            with open(attachment_path, 'rb') as attachment:
+                part = MIMEApplication(
+                    attachment.read(),
+                    Name=excel_filename
+                )
+            part['Content-Disposition'] = (
+                f'attachment; filename="{excel_filename}"'
+            )
+            msg.attach(part)
         elif attachment_path:
             logging.warning(f"⚠️ Attachment not found: {attachment_path}")
 
